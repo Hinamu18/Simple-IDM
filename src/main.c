@@ -1,77 +1,126 @@
 #include "IDM.h"
+#include "TUI.h"
+#include "handling.h"
+#include "state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <unistd.h>
 
-static size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream)
-{
-    size_t written = fwrite(ptr, size, nmemb, (FILE *)stream);
-    return written;
+char *global_url = NULL;
+
+char *tokenize(const char *url_str) {
+  const char *last_slash = strrchr(url_str, '/');
+  if (last_slash && *(last_slash + 1) != '\0') {
+    return strdup(last_slash + 1);
+  }
+  return strdup("downloaded_file.out");
 }
 
-char* tokenize(char *str){
-	
-    char *res;
-    int i = 0, index = -1;
-    int len = strlen(str);
+// threads and UI Loop
+void run_download_loop(const char *filename, int64_t total_file_size,
+                       int64_t bytes_loaded_from_state, DownloadChunk *chunks,
+                       int num_chunks) {
+  pthread_t threads[NUM_THREADS];
+  for (int i = 0; i < num_chunks; i++) {
+    pthread_create(&threads[i], NULL, download_worker, &chunks[i]);
+  }
 
-    while (str[i] != '\0') {
-        if (str[i] == '/') {
-            index = i+1;
-        }
-        i++;
+  struct timeval start_time, current_time;
+  gettimeofday(&start_time, NULL);
+
+  int all_finished = 0;
+  while (!all_finished && !stop_flag) {
+    all_finished = 1;
+
+    int ch = tui_check_input();
+    if (ch == 's' || ch == 'q') {
+      stop_flag = 1;
+      break;
     }
 
-    res = malloc(index + 1);
-    for (int j = 0; j < index; j++) {
-        res[j] = str[j+index];
+    gettimeofday(&current_time, NULL);
+    double elapsed_secs =
+        (current_time.tv_sec - start_time.tv_sec) +
+        (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+
+    int64_t total_downloaded_now = 0;
+    for (int i = 0; i < num_chunks; i++) {
+      total_downloaded_now += (chunks[i].current_byte - chunks[i].start_byte);
+      if (!chunks[i].is_finished)
+        all_finished = 0;
     }
 
-    res[index] = '\0';
+    int64_t session_downloaded = total_downloaded_now - bytes_loaded_from_state;
+    double speed_bps =
+        (elapsed_secs > 0) ? (session_downloaded / elapsed_secs) : 0;
+    int eta_secs = (speed_bps > 0)
+                       ? ((total_file_size - total_downloaded_now) / speed_bps)
+                       : 0;
+    float overall_percent =
+        (float)total_downloaded_now / total_file_size * 100.0f;
 
-    printf("%s", res);
-    return res;
+    tui_draw_progress(filename, total_file_size, total_downloaded_now,
+                      speed_bps, eta_secs, overall_percent, chunks, num_chunks);
+
+    usleep(100000); // 100ms refresh rate
+  }
+
+  for (int i = 0; i < num_chunks; i++) {
+    pthread_join(threads[i], NULL);
+  }
 }
 
-int main(int argc, char *argv[]) {
+// saving state and file assembly
+void finalize_download(const char *filename, const char *state_file,
+                       DownloadChunk *chunks, int num_chunks) {
+  if (stop_flag) {
+    printf("\n\n[!] Download Paused. Saving state to %s...\n", state_file);
+    save_state(state_file, global_url, chunks, num_chunks);
+  } else {
+    printf("\n\n[✓] Download Complete. Assembling file...\n");
+    if (assemble_file(filename, num_chunks) == 0) {
+      printf("[✓] Assembly successful. Cleaning up state file.\n");
+      remove(state_file);
+    }
+  }
+}
 
-	// 1. Call get_file_size()
-	// 2. Calculate chunk boundaries
-	// 3. Spawn pthreads using download_worker()
-	// 4. Join pthreads
-	// 5. Call assemble_file()
+int main() {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  tui_init();
 
-	if (argc > 2) {
-		printf("Usage: %s <url>",argv[0]);
-		return EXIT_FAILURE;
-	}
+  char state_file[256];
+  char *filename = NULL;
 
-	CURL *curl = curl_easy_init();
-	
-	char *output = tokenize(argv[1]);
-	FILE *fp = fopen(output, "wb");
+  int choice = tui_show_main_menu();
+  if (choice == 3) {
+    tui_cleanup();
+    return 0;
+  }
 
-	if (!curl) {
-		printf("curl init error");
-		return EXIT_FAILURE;
-	}
+  DownloadChunk chunks[NUM_THREADS];
+  int num_chunks = NUM_THREADS;
+  int64_t total_file_size = 0;
+  int64_t bytes_loaded_from_state = 0;
 
+  if (choice == 1) {
+    if (handle_new_download(&filename, state_file, &total_file_size, chunks) !=
+        0)
+      return EXIT_FAILURE;
+  } else if (choice == 2) {
+    if (handle_resume_download(&filename, state_file, &total_file_size,
+                               &bytes_loaded_from_state, chunks,
+                               &num_chunks) != 0)
+      return EXIT_FAILURE;
+  }
+  run_download_loop(filename, total_file_size, bytes_loaded_from_state, chunks,
+                    num_chunks);
+  tui_cleanup();
+  finalize_download(filename, state_file, chunks, num_chunks);
+  free(filename);
 
-	curl_easy_setopt(curl,CURLOPT_URL,argv[1]);
-
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
-
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-	curl_easy_perform(curl);
-
-	curl_easy_cleanup(curl);
-	fclose(fp);
-	curl_global_cleanup();
-	free(output);
-
-
-	return 0;
+  curl_global_cleanup();
+  return 0;
 }

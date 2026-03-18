@@ -1,2 +1,6 @@
+SRC=src/*.c 
+LIBS= -lcurl -pthread -lncurses
+output = -o IDM
+FLAGS = -O3
 all:
-	gcc -o IDM src/main.c src/IDM.c -lcurl 
+	gcc $(SRC) $(LIBS) $(output)
